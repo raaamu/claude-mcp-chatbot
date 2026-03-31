@@ -1,35 +1,67 @@
 #!/usr/bin/env python3
 """
-Claude web chatbot with streaming, Gmail MCP tools, and Gradio UI.
+Web chatbot with streaming, Gmail MCP tools, and Gradio UI.
+Supports OpenRouter (Anthropic/OpenAI/xAI) and direct xAI API.
 
 Usage:
-    export ANTHROPIC_API_KEY=sk-ant-...
-    python web_chatbot.py        # opens http://localhost:7860
+    # OpenRouter (default — Claude Opus 4.6)
+    export OPENROUTER_API_KEY=sk-or-...
+    python web_chatbot.py
+
+    # xAI directly
+    export XAI_API_KEY=xai-...
+    python web_chatbot.py --provider xai
+
+    # Specific model
+    python web_chatbot.py --provider xai --model grok-2
+    python web_chatbot.py --model sonnet
 """
 
+import argparse
 import asyncio
+import json
 import os
 import sys
 import threading
 from pathlib import Path
 from typing import Generator
 
-import anthropic
 import gradio as gr
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from openai import OpenAI, APIError
 
-MODEL = "claude-opus-4-6"
+SERVER_SCRIPT = str(Path(__file__).parent / "gmail_mcp_server.py")
+
 SYSTEM_PROMPT = os.environ.get(
-    "CLAUDE_SYSTEM_PROMPT",
+    "CHATBOT_SYSTEM_PROMPT",
     "You are a helpful assistant with access to Gmail. "
     "You can search, read, and summarize emails when asked. "
     "When reading emails, be concise — summarize unless the user asks for the full text. "
     "If a request is ambiguous, ask a clarifying question.",
 )
-SERVER_SCRIPT = str(Path(__file__).parent / "gmail_mcp_server.py")
 
-anthropic_client = anthropic.Anthropic()
+# ── Providers & model aliases ─────────────────────────────────────────────────
+
+PROVIDERS: dict[str, dict] = {
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "env_var":  "OPENROUTER_API_KEY",
+        "default_model": "anthropic/claude-opus-4.6",
+    },
+    "xai": {
+        "base_url": "https://api.x.ai/v1",
+        "env_var":  "XAI_API_KEY",
+        "default_model": "grok-2",
+    },
+}
+
+MODEL_ALIASES: dict[str, str] = {
+    "claude":  "anthropic/claude-opus-4.6",
+    "sonnet":  "anthropic/claude-sonnet-4.6",
+    "gpt4":    "openai/gpt-4o",
+    "grok":    "x-ai/grok-4.20-beta",
+}
 
 
 # ── MCP client (persistent background thread) ────────────────────────────────
@@ -39,7 +71,7 @@ class MCPClient:
 
     def __init__(self, server_script: str):
         self._server_script = server_script
-        self.tools: list[dict] = []
+        self.tools: list[dict] = []          # stored in Anthropic input_schema format
         self.status = "not started"
         self._session: ClientSession | None = None
         self._loop = asyncio.new_event_loop()
@@ -47,22 +79,16 @@ class MCPClient:
         self._thread = threading.Thread(target=self._run, daemon=True, name="mcp-thread")
 
     def start(self) -> bool:
-        """Start the MCP server. Returns True if connected successfully."""
         self._thread.start()
         self._ready.wait(timeout=45)
         return bool(self._session)
-
-    # ── background thread ────────────────────────────────────────────────────
 
     def _run(self):
         asyncio.set_event_loop(self._loop)
         self._loop.run_until_complete(self._connect())
 
     async def _connect(self):
-        params = StdioServerParameters(
-            command=sys.executable,
-            args=[self._server_script],
-        )
+        params = StdioServerParameters(command=sys.executable, args=[self._server_script])
         try:
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
@@ -83,12 +109,24 @@ class MCPClient:
                     self._session = session
                     self.status = f"{len(self.tools)} tools loaded"
                     self._ready.set()
-                    await asyncio.sleep(float("inf"))   # keep alive
+                    await asyncio.sleep(float("inf"))
         except Exception as e:
             self.status = f"failed: {e}"
             self._ready.set()
 
-    # ── called from Gradio thread ─────────────────────────────────────────────
+    def openai_tools(self) -> list[dict]:
+        """Return tools in OpenAI function-calling format."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t["input_schema"],
+                },
+            }
+            for t in self.tools
+        ]
 
     def call_tool(self, name: str, tool_input: dict) -> str:
         if not self._session:
@@ -107,112 +145,117 @@ class MCPClient:
             return f"[Tool error: {e}]"
 
 
-# ── Content block helpers ─────────────────────────────────────────────────────
-
-def _blocks_to_params(blocks) -> list[dict]:
-    """Convert SDK ContentBlock objects → dict params safe to send in next turn."""
-    result = []
-    for b in blocks:
-        if b.type == "text":
-            result.append({"type": "text", "text": b.text})
-        elif b.type == "tool_use":
-            result.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
-        elif b.type == "thinking":
-            result.append({"type": "thinking", "thinking": b.thinking, "signature": b.signature})
-        # redacted_thinking blocks are intentionally dropped
-    return result
-
-
-def _text_from_blocks(blocks) -> str:
-    return "".join(b.text for b in blocks if b.type == "text")
-
-
 # ── Chat logic ────────────────────────────────────────────────────────────────
 
 def respond(
     message: str,
     chatbot: list[dict],
-    claude_msgs: list[dict],
+    msgs: list[dict],
 ) -> Generator[tuple[list[dict], list[dict]], None, None]:
-    """Streaming chat generator. Yields (chatbot, claude_msgs) on every token."""
+    """Streaming chat generator. Yields (chatbot, msgs) on every token."""
 
     if not message.strip():
-        yield chatbot, claude_msgs
+        yield chatbot, msgs
         return
 
-    # Append user turn to both display history and Claude history
     chatbot = list(chatbot) + [
         {"role": "user", "content": message},
         {"role": "assistant", "content": ""},
     ]
-    claude_msgs = list(claude_msgs) + [{"role": "user", "content": message}]
+    msgs = list(msgs) + [{"role": "user", "content": message}]
+    yield chatbot, msgs
 
-    yield chatbot, claude_msgs
-
-    tools = mcp.tools
-    display_text = ""  # accumulates everything shown in the current assistant bubble
+    openai_tools = mcp.openai_tools()
+    display_text = ""
 
     try:
         while True:
-            stream_kwargs: dict = dict(
-                model=MODEL,
-                max_tokens=64000,
-                thinking={"type": "adaptive"},
-                system=SYSTEM_PROMPT,
-                messages=claude_msgs,
+            api_msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + msgs
+
+            stream = llm_client.chat.completions.create(
+                model=model,
+                messages=api_msgs,
+                tools=openai_tools if openai_tools else None,
+                tool_choice="auto" if openai_tools else None,
+                stream=True,
+                stream_options={"include_usage": True},
             )
-            if tools:
-                stream_kwargs["tools"] = tools
-                stream_kwargs["tool_choice"] = {"type": "auto"}
 
-            with anthropic_client.messages.stream(**stream_kwargs) as stream:
-                chunk = ""
-                for event in stream:
-                    if (
-                        event.type == "content_block_delta"
-                        and event.delta.type == "text_delta"
-                    ):
-                        chunk += event.delta.text
-                        chatbot[-1]["content"] = display_text + chunk
-                        yield chatbot, claude_msgs
+            chunk_text = ""
+            tool_calls_buf: dict[int, dict] = {}  # index → accumulated tool call
+            finish_reason = None
 
-                final = stream.get_final_message()
-                display_text += chunk
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                finish_reason = choice.finish_reason or finish_reason
+                delta = choice.delta
 
-            if final.stop_reason != "tool_use":
-                # Natural end — commit assistant message as plain text
+                if delta.content:
+                    chunk_text += delta.content
+                    chatbot[-1]["content"] = display_text + chunk_text
+                    yield chatbot, msgs
+
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in tool_calls_buf:
+                            tool_calls_buf[idx] = {"id": "", "name": "", "arguments": ""}
+                        if tc.id:
+                            tool_calls_buf[idx]["id"] = tc.id
+                        if tc.function:
+                            if tc.function.name:
+                                tool_calls_buf[idx]["name"] += tc.function.name
+                            if tc.function.arguments:
+                                tool_calls_buf[idx]["arguments"] += tc.function.arguments
+
+            display_text += chunk_text
+
+            if finish_reason != "tool_calls":
                 chatbot[-1]["content"] = display_text
-                claude_msgs = claude_msgs + [{"role": "assistant", "content": display_text}]
-                yield chatbot, claude_msgs
+                msgs = msgs + [{"role": "assistant", "content": display_text}]
+                yield chatbot, msgs
                 break
 
-            # Tool use — preserve full content (thinking + tool_use blocks) for context
-            claude_msgs = claude_msgs + [
-                {"role": "assistant", "content": _blocks_to_params(final.content)}
+            # Build the assistant message with tool_calls
+            tool_calls_list = [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                }
+                for tc in tool_calls_buf.values()
             ]
+            msgs = msgs + [{
+                "role": "assistant",
+                "content": chunk_text or None,
+                "tool_calls": tool_calls_list,
+            }]
 
-            tool_results = []
-            for block in final.content:
-                if block.type != "tool_use":
-                    continue
+            # Execute each tool and collect results
+            for tc in tool_calls_list:
+                name = tc["function"]["name"]
+                try:
+                    tool_input = json.loads(tc["function"]["arguments"])
+                except json.JSONDecodeError:
+                    tool_input = {}
 
-                notice = f"\n\n**[Tool: {block.name}]**\n"
+                notice = f"\n\n**[Tool: {name}]**\n"
                 display_text += notice
                 chatbot[-1]["content"] = display_text
-                yield chatbot, claude_msgs
+                yield chatbot, msgs
 
-                tool_result = mcp.call_tool(block.name, block.input)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": tool_result,
-                })
+                result = mcp.call_tool(name, tool_input)
+                msgs = msgs + [{
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result,
+                }]
 
-            claude_msgs = claude_msgs + [{"role": "user", "content": tool_results}]
-
-    except anthropic.APIError as e:
+    except APIError as e:
         chatbot[-1]["content"] = display_text + f"\n\n**[API error: {e}]**"
-        yield chatbot, claude_msgs
+        yield chatbot, msgs
 
 
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
@@ -222,16 +265,18 @@ def build_ui() -> gr.Blocks:
     mcp_badge = (
         f"Gmail connected — {tool_count} tools available"
         if tool_count
-        else f"Gmail unavailable ({mcp.status}) — chatbot runs without email access"
+        else f"Gmail unavailable ({mcp.status})"
     )
 
-    with gr.Blocks(title="Claude + Gmail", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("## Claude + Gmail Assistant")
+    with gr.Blocks(title="Chatbot + Gmail", theme=gr.themes.Soft()) as demo:
+        gr.Markdown("## Chatbot + Gmail Assistant")
         gr.Markdown(
-            f"**Model:** `{MODEL}` &nbsp;|&nbsp; **MCP:** {mcp_badge}"
+            f"**Model:** `{model}` &nbsp;|&nbsp; "
+            f"**Provider:** {provider_name} &nbsp;|&nbsp; "
+            f"**MCP:** {mcp_badge}"
         )
 
-        claude_state = gr.State([])
+        msgs_state = gr.State([])
 
         chatbot = gr.Chatbot(
             type="messages",
@@ -254,36 +299,59 @@ def build_ui() -> gr.Blocks:
         with gr.Accordion("System prompt", open=False):
             gr.Markdown(f"```\n{SYSTEM_PROMPT}\n```")
 
-        # Wire up events
-        submit_event = (
-            msg_box.submit(
-                respond,
-                inputs=[msg_box, chatbot, claude_state],
-                outputs=[chatbot, claude_state],
-            )
-            .then(lambda: gr.update(value=""), outputs=msg_box)
-        )
+        msg_box.submit(
+            respond,
+            inputs=[msg_box, chatbot, msgs_state],
+            outputs=[chatbot, msgs_state],
+        ).then(lambda: gr.update(value=""), outputs=msg_box)
 
         send_btn.click(
             respond,
-            inputs=[msg_box, chatbot, claude_state],
-            outputs=[chatbot, claude_state],
+            inputs=[msg_box, chatbot, msgs_state],
+            outputs=[chatbot, msgs_state],
         ).then(lambda: gr.update(value=""), outputs=msg_box)
 
-        clear_btn.click(
-            lambda: ([], []),
-            outputs=[chatbot, claude_state],
-        )
+        clear_btn.click(lambda: ([], []), outputs=[chatbot, msgs_state])
 
     return demo
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Web chatbot with Gmail MCP")
+    parser.add_argument(
+        "--provider", "-p",
+        default="openrouter",
+        choices=list(PROVIDERS),
+        help="API provider (default: openrouter)",
+    )
+    parser.add_argument(
+        "--model", "-m",
+        default=None,
+        help="Model alias or full model ID (default: provider's default)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("Error: ANTHROPIC_API_KEY is not set.")
+    args = parse_args()
+    provider_name = args.provider
+    provider_cfg = PROVIDERS[provider_name]
+
+    raw_model = args.model or provider_cfg["default_model"]
+    model = MODEL_ALIASES.get(raw_model, raw_model)
+
+    api_key = os.environ.get(provider_cfg["env_var"])
+    if not api_key:
+        print(f"Error: {provider_cfg['env_var']} is not set.")
+        if provider_name == "xai":
+            print("Get a key at https://console.x.ai/")
+        else:
+            print("Get a key at https://openrouter.ai/settings/keys")
         sys.exit(1)
+
+    llm_client = OpenAI(base_url=provider_cfg["base_url"], api_key=api_key)
 
     print("Connecting to Gmail MCP server…")
     mcp = MCPClient(SERVER_SCRIPT)
