@@ -268,7 +268,7 @@ def build_ui() -> gr.Blocks:
         else f"Gmail unavailable ({mcp.status})"
     )
 
-    with gr.Blocks(title="Chatbot + Gmail", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="Chatbot + Gmail") as demo:
         gr.Markdown("## Chatbot + Gmail Assistant")
         gr.Markdown(
             f"**Model:** `{model}` &nbsp;|&nbsp; "
@@ -279,9 +279,8 @@ def build_ui() -> gr.Blocks:
         msgs_state = gr.State([])
 
         chatbot = gr.Chatbot(
-            type="messages",
             height=560,
-            show_copy_button=True,
+            buttons=["copy", "copy_all"],
             label="Conversation",
             render_markdown=True,
         )
@@ -363,4 +362,4 @@ if __name__ == "__main__":
 
     demo = build_ui()
     demo.queue()
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, theme=gr.themes.Soft())
