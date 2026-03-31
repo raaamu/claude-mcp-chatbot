@@ -1,15 +1,36 @@
 #!/usr/bin/env python3
-"""Multi-turn Claude chatbot with streaming, token tracking, and save/load."""
+"""
+Multi-turn chatbot via OpenRouter — supports Anthropic, OpenAI, and xAI.
 
+Usage:
+    export OPENROUTER_API_KEY=sk-or-...
+    python chatbot.py                          # default model (Claude Opus 4.6)
+    python chatbot.py --model claude           # Anthropic Claude Opus 4.6
+    python chatbot.py --model sonnet           # Anthropic Claude Sonnet 4.6
+    python chatbot.py --model gpt4            # OpenAI GPT-4o
+    python chatbot.py --model grok            # xAI Grok
+    python chatbot.py --model anthropic/claude-opus-4.6  # full OpenRouter model ID
+"""
+
+import argparse
 import json
 import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
-import anthropic
+from openai import OpenAI, APIError
 
-MODEL = "claude-opus-4-6"
+# ── Model aliases ─────────────────────────────────────────────────────────────
+
+MODEL_ALIASES: dict[str, str] = {
+    "claude":  "anthropic/claude-opus-4.6",
+    "sonnet":  "anthropic/claude-sonnet-4.6",
+    "gpt4":    "openai/gpt-4o",
+    "grok":    "x-ai/grok-4.20-beta",
+}
+DEFAULT_MODEL = "anthropic/claude-opus-4.6"
+
 HISTORY_FILE = Path("chat_history.json")
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -22,41 +43,51 @@ Commands:
   /clear   — Clear conversation history
   /save    — Save history to chat_history.json
   /load    — Load history from chat_history.json
+  /model   — Show current model
   /system  — Show current system prompt
   /help    — Show this help
   /quit    — Exit
 """
 
 
-def stream_response(client: anthropic.Anthropic, messages: list, system: str) -> tuple[str, int, int]:
+# ── Streaming ─────────────────────────────────────────────────────────────────
+
+def stream_response(
+    client: OpenAI, model: str, messages: list, system: str
+) -> tuple[str, int, int]:
     """Stream a response and return (full_text, input_tokens, output_tokens)."""
     full_text = ""
     input_tokens = 0
     output_tokens = 0
 
-    with client.messages.stream(
-        model=MODEL,
-        max_tokens=64000,
-        thinking={"type": "adaptive"},
-        system=system,
-        messages=messages,
-    ) as stream:
-        for event in stream:
-            if event.type == "content_block_delta" and event.delta.type == "text_delta":
-                print(event.delta.text, end="", flush=True)
-                full_text += event.delta.text
+    all_messages = [{"role": "system", "content": system}] + messages
 
-        final = stream.get_final_message()
-        input_tokens = final.usage.input_tokens
-        output_tokens = final.usage.output_tokens
+    stream = client.chat.completions.create(
+        model=model,
+        messages=all_messages,
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+
+    for chunk in stream:
+        delta = chunk.choices[0].delta if chunk.choices else None
+        if delta and delta.content:
+            print(delta.content, end="", flush=True)
+            full_text += delta.content
+        if chunk.usage:
+            input_tokens = chunk.usage.prompt_tokens
+            output_tokens = chunk.usage.completion_tokens
 
     print()  # newline after streamed response
     return full_text, input_tokens, output_tokens
 
 
-def save_history(messages: list, system: str) -> None:
+# ── Save / load ───────────────────────────────────────────────────────────────
+
+def save_history(messages: list, system: str, model: str) -> None:
     data = {
         "saved_at": datetime.now().isoformat(),
+        "model": model,
         "system": system,
         "messages": messages,
     }
@@ -64,32 +95,52 @@ def save_history(messages: list, system: str) -> None:
     print(f"[Saved to {HISTORY_FILE}]")
 
 
-def load_history() -> tuple[list, str | None]:
+def load_history() -> tuple[list, str | None, str | None]:
     if not HISTORY_FILE.exists():
         print(f"[No history file found at {HISTORY_FILE}]")
-        return [], None
+        return [], None, None
     data = json.loads(HISTORY_FILE.read_text())
     print(f"[Loaded {len(data['messages'])} messages from {data['saved_at']}]")
-    return data["messages"], data.get("system")
+    return data["messages"], data.get("system"), data.get("model")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Multi-provider chatbot via OpenRouter")
+    parser.add_argument(
+        "--model", "-m",
+        default=DEFAULT_MODEL,
+        help=(
+            f"Model alias ({', '.join(MODEL_ALIASES)}) "
+            "or full OpenRouter model ID (default: %(default)s)"
+        ),
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    args = parse_args()
+    model = MODEL_ALIASES.get(args.model, args.model)
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        print("Error: ANTHROPIC_API_KEY environment variable is not set.")
+        print("Error: OPENROUTER_API_KEY environment variable is not set.")
+        print("Get a key at https://openrouter.ai/settings/keys")
         sys.exit(1)
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
 
-    # Allow overriding the system prompt via env var
-    system = os.environ.get("CLAUDE_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
+    system = os.environ.get("CHATBOT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
     messages: list = []
-
     total_input_tokens = 0
     total_output_tokens = 0
 
-    print(f"Claude Chatbot ({MODEL})")
-    print(f"System: {system}")
+    print(f"Chatbot — model: {model} (via OpenRouter)")
+    print(f"System:  {system}")
     print(COMMANDS)
 
     while True:
@@ -102,7 +153,6 @@ def main() -> None:
         if not user_input:
             continue
 
-        # Handle commands
         if user_input.startswith("/"):
             cmd = user_input.lower()
             if cmd == "/quit":
@@ -114,13 +164,18 @@ def main() -> None:
                 total_output_tokens = 0
                 print("[Conversation cleared]")
             elif cmd == "/save":
-                save_history(messages, system)
+                save_history(messages, system, model)
             elif cmd == "/load":
-                loaded_messages, loaded_system = load_history()
+                loaded_messages, loaded_system, loaded_model = load_history()
                 messages = loaded_messages
                 if loaded_system:
                     system = loaded_system
                     print(f"[System prompt restored: {system}]")
+                if loaded_model:
+                    model = loaded_model
+                    print(f"[Model restored: {model}]")
+            elif cmd == "/model":
+                print(f"[Model: {model}]")
             elif cmd == "/system":
                 print(f"[System: {system}]")
             elif cmd == "/help":
@@ -131,14 +186,14 @@ def main() -> None:
 
         messages.append({"role": "user", "content": user_input})
 
-        print("Claude: ", end="", flush=True)
+        print("Assistant: ", end="", flush=True)
         try:
             response_text, input_tokens, output_tokens = stream_response(
-                client, messages, system
+                client, model, messages, system
             )
-        except anthropic.APIError as e:
+        except APIError as e:
             print(f"\n[API error: {e}]")
-            messages.pop()  # remove the user message we just added
+            messages.pop()
             continue
 
         messages.append({"role": "assistant", "content": response_text})
