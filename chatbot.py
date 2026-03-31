@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-Multi-turn chatbot via OpenRouter — supports Anthropic, OpenAI, and xAI.
+Multi-turn chatbot — supports OpenRouter (multi-provider) or direct xAI API.
 
-Usage:
+Via OpenRouter (Anthropic, OpenAI, xAI through one key):
     export OPENROUTER_API_KEY=sk-or-...
-    python chatbot.py                          # default model (Claude Opus 4.6)
     python chatbot.py --model claude           # Anthropic Claude Opus 4.6
     python chatbot.py --model sonnet           # Anthropic Claude Sonnet 4.6
-    python chatbot.py --model gpt4            # OpenAI GPT-4o
-    python chatbot.py --model grok            # xAI Grok
+    python chatbot.py --model gpt4             # OpenAI GPT-4o
+    python chatbot.py --model grok             # xAI Grok (via OpenRouter)
     python chatbot.py --model anthropic/claude-opus-4.6  # full OpenRouter model ID
+
+Via xAI directly (your xAI API key):
+    export XAI_API_KEY=xai-...
+    python chatbot.py --provider xai                     # default: grok-2
+    python chatbot.py --provider xai --model grok-2
+    python chatbot.py --provider xai --model grok-2-mini
 """
 
 import argparse
@@ -21,7 +26,22 @@ from pathlib import Path
 
 from openai import OpenAI, APIError
 
-# ── Model aliases ─────────────────────────────────────────────────────────────
+# ── Providers ─────────────────────────────────────────────────────────────────
+
+PROVIDERS: dict[str, dict] = {
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "env_var":  "OPENROUTER_API_KEY",
+        "default_model": "anthropic/claude-opus-4.6",
+    },
+    "xai": {
+        "base_url": "https://api.x.ai/v1",
+        "env_var":  "XAI_API_KEY",
+        "default_model": "grok-2",
+    },
+}
+
+# ── Model aliases (OpenRouter) ────────────────────────────────────────────────
 
 MODEL_ALIASES: dict[str, str] = {
     "claude":  "anthropic/claude-opus-4.6",
@@ -107,13 +127,21 @@ def load_history() -> tuple[list, str | None, str | None]:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Multi-provider chatbot via OpenRouter")
+    parser = argparse.ArgumentParser(description="Multi-provider chatbot")
+    parser.add_argument(
+        "--provider", "-p",
+        default="openrouter",
+        choices=list(PROVIDERS),
+        help="API provider to use (default: openrouter)",
+    )
     parser.add_argument(
         "--model", "-m",
-        default=DEFAULT_MODEL,
+        default=None,
         help=(
-            f"Model alias ({', '.join(MODEL_ALIASES)}) "
-            "or full OpenRouter model ID (default: %(default)s)"
+            "Model alias or full model ID. "
+            f"OpenRouter aliases: {', '.join(MODEL_ALIASES)}. "
+            "xAI models: grok-2, grok-2-mini. "
+            "Defaults to provider's default model."
         ),
     )
     return parser.parse_args()
@@ -121,16 +149,23 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    model = MODEL_ALIASES.get(args.model, args.model)
+    provider = PROVIDERS[args.provider]
 
-    api_key = os.environ.get("OPENROUTER_API_KEY")
+    # Resolve model: CLI arg > alias expansion > provider default
+    raw_model = args.model or provider["default_model"]
+    model = MODEL_ALIASES.get(raw_model, raw_model)
+
+    api_key = os.environ.get(provider["env_var"])
     if not api_key:
-        print("Error: OPENROUTER_API_KEY environment variable is not set.")
-        print("Get a key at https://openrouter.ai/settings/keys")
+        print(f"Error: {provider['env_var']} environment variable is not set.")
+        if args.provider == "xai":
+            print("Get a key at https://console.x.ai/")
+        else:
+            print("Get a key at https://openrouter.ai/settings/keys")
         sys.exit(1)
 
     client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
+        base_url=provider["base_url"],
         api_key=api_key,
     )
 
@@ -139,7 +174,7 @@ def main() -> None:
     total_input_tokens = 0
     total_output_tokens = 0
 
-    print(f"Chatbot — model: {model} (via OpenRouter)")
+    print(f"Chatbot — model: {model} (via {args.provider})")
     print(f"System:  {system}")
     print(COMMANDS)
 
